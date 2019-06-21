@@ -15,23 +15,73 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
 	"unsafe"
 	"bytes"
+	"github.com/BurntSushi/toml"
 
 	"github.com/kr/pty"
 	"golang.org/x/crypto/ssh"
 	"crypto/subtle"
 )
 
+type Conf struct {
+	Whitelist []string
+	WhitelistCIDR []*net.IPNet
+}
+
+var (
+	C        *Conf
+	Verbose  bool
+)
+
+func Init(path string) error {
+	r, e := os.Open(path)
+	if e != nil {
+		return e
+	}
+	defer r.Close()
+
+	C = new(Conf)
+	if _, e := toml.DecodeReader(r, &C); e != nil {
+		return fmt.Errorf("TOML: %s", e)
+	}
+	for _, ip := range C.Whitelist {
+		_, cidr, e := net.ParseCIDR(ip)
+		if e != nil {
+			return e
+		}
+		C.WhitelistCIDR = append(C.WhitelistCIDR, cidr)
+	}
+	return nil
+}
+
+
 func main() {
+	flag.BoolVar(&Verbose, "v", false, "Verbose-mode (log more)")
+	flag.Parse()
+
+	if e := Init("./config.toml"); e != nil {
+		panic(e)
+	}
+
+	/*listeners, e := activation.Listeners()
+	if e != nil {
+		panic(e)
+	}
+	if len(listeners) != 2 {
+		panic(fmt.Errorf("fd.socket activation (%d != 2)\n", len(listeners)))
+	}*/
+
 	var userkey []byte
 	{
 		userbytes, e := ioutil.ReadFile("authorized_keys")
@@ -66,14 +116,15 @@ func main() {
 			if subtle.ConstantTimeCompare(clientKey, userkey) == 1 {
 				return &ssh.Permissions{Extensions: map[string]string{"key-id": "1"}}, nil
 			}
-			fmt.Printf("Mismatch pubkeys.\nFound=%s\nWant=%s\n", clientKey, userkey)
+			//fmt.Printf("Mismatch pubkeys.\nFound=%s\nWant=%s\n", clientKey, userkey)
 			return nil, fmt.Errorf("pubkey reject for %q", c.User())
 		},
-
-		//Define a function to run when a client attempts a password login
-		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			return nil, fmt.Errorf("password rejected for %q", c.User())
+		BannerCallback: func(conn ssh.ConnMetadata) string {
+			return "ALERT! All connections are monitored and recorded.\nDisconnect IMMEDIATELY if you are not an authorized user!\n"
 		},
+
+		PasswordCallback: nil, // don't allow pass
+		MaxAuthTries: 1,
 		NoClientAuth: false,
 	}
 
@@ -91,19 +142,50 @@ func main() {
 	config.AddHostKey(private)
 
 	// Once a ServerConfig has been configured, connections can be accepted.
-	listener, err := net.Listen("tcp", "0.0.0.0:2200")
+	listener, err := net.Listen("tcp", ":2200")
 	if err != nil {
 		log.Fatalf("Failed to listen on 2200 (%s)", err)
 	}
 
 	// Accept all connections
-	log.Print("Listening on 2200...")
+	if Verbose {
+		log.Print("Listening on 2200...")
+	}
 	for {
 		tcpConn, err := listener.Accept()
 		if err != nil {
 			log.Printf("Failed to accept incoming connection (%s)", err)
 			continue
 		}
+		addr, ok := tcpConn.RemoteAddr().(*net.TCPAddr)
+		if !ok {
+			log.Printf("Failed convert conn to TCPAddr (%s)", addr)
+			continue
+		}
+
+		ok = false
+		for _, cidr := range C.WhitelistCIDR {
+			if Verbose {
+				log.Printf("IP.check(%s, %s) ", cidr, addr.IP)
+			}
+			if cidr.Contains(addr.IP) {
+				if Verbose {
+					log.Printf("match!\n")
+				}
+				ok = true
+				break
+			}
+
+			if Verbose {
+				log.Printf("no!\n")
+			}
+		}
+		if !ok {
+			tcpConn.Write([]byte("IP not allowed.\n"))
+			tcpConn.Close()
+			continue
+		}
+
 		// Before use, a handshake must be performed on the incoming net.Conn.
 		sshConn, chans, reqs, err := ssh.NewServerConn(tcpConn, config)
 		if err != nil {
@@ -111,22 +193,22 @@ func main() {
 			continue
 		}
 
-		log.Printf("New SSH connection from %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
+		log.Printf("ssh.begin(%s) user=%s version=%s", sshConn.RemoteAddr(), sshConn.User(), sshConn.ClientVersion())
 		// Discard all global out-of-band Requests
 		go ssh.DiscardRequests(reqs)
 		// Accept all channels
-		go handleChannels(chans)
+		go handleChannels(sshConn, chans)
 	}
 }
 
-func handleChannels(chans <-chan ssh.NewChannel) {
+func handleChannels(sshConn *ssh.ServerConn, chans <-chan ssh.NewChannel) {
 	// Service the incoming Channel channel in go routine
 	for newChannel := range chans {
-		go handleChannel(newChannel)
+		go handleChannel(sshConn, newChannel)
 	}
 }
 
-func handleChannel(newChannel ssh.NewChannel) {
+func handleChannel(sshConn *ssh.ServerConn, newChannel ssh.NewChannel) {
 	// Since we're handling a shell, we expect a
 	// channel type of "session". The also describes
 	// "x11", "direct-tcpip" and "forwarded-tcpip"
@@ -154,11 +236,10 @@ func handleChannel(newChannel ssh.NewChannel) {
 		if err != nil {
 			log.Printf("Failed to exit bash (%s)", err)
 		}
-		log.Printf("Session closed")
+		log.Printf("ssh.close(%s) user=%s", sshConn.RemoteAddr(), sshConn.User())
 	}
 
 	// Allocate a terminal for this channel
-	log.Print("Creating pty...")
 	bashf, err := pty.Start(bash)
 	if err != nil {
 		log.Printf("Could not start pty (%s)", err)
