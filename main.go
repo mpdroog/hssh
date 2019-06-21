@@ -28,6 +28,7 @@ import (
 	"unsafe"
 	"bytes"
 	"github.com/BurntSushi/toml"
+	"github.com/coreos/go-systemd/daemon"
 
 	"github.com/kr/pty"
 	"golang.org/x/crypto/ssh"
@@ -151,6 +152,15 @@ func main() {
 	if Verbose {
 		log.Print("Listening on 2200...")
 	}
+
+	sent, e := daemon.SdNotify(false, "READY=1")
+	if e != nil {
+		log.Fatal(e)
+	}
+	if !sent {
+		log.Printf("SystemD notify NOT sent\n")
+	}
+
 	for {
 		tcpConn, err := listener.Accept()
 		if err != nil {
