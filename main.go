@@ -33,6 +33,7 @@ import (
 	"github.com/kr/pty"
 	"golang.org/x/crypto/ssh"
 	"crypto/subtle"
+	//"golang.org/x/crypto/ssh/terminal"
 )
 
 type Conf struct {
@@ -238,6 +239,7 @@ func handleChannel(sshConn *ssh.ServerConn, newChannel ssh.NewChannel) {
 
 	// Fire up bash for this session
 	bash := exec.Command("bash")
+	bash.Env = []string{"TERM=vt100"}
 
 	// Prepare teardown function
 	close := func() {
@@ -256,6 +258,7 @@ func handleChannel(sshConn *ssh.ServerConn, newChannel ssh.NewChannel) {
 		close()
 		return
 	}
+	// TODO defer bashf.Close()
 
 	//pipe session to bash and visa-versa
 	var once sync.Once
