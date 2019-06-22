@@ -1,0 +1,19 @@
+[Unit]
+Description=hSSH
+Requires=network.target
+After=multi-user.target
+
+[Service]
+LimitNOFILE=100
+Type=notify
+
+ExecStart=/home/mark/hssh/hssh
+User=mark
+Group=mark
+WorkingDirectory=/home/mark/hssh
+
+# CGroup ruling
+MemoryLimit=512M
+
+[Install]
+WantedBy=multi-user.target
